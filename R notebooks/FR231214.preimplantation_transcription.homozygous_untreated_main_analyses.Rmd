@@ -1,0 +1,481 @@
+---
+title: "Preimplantation - first data exploration"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Summary of notebook
+
+### Files generated 
+- "../output/FR210121.CELseq2.stage_markers.Seurat_FindAllMarkers_default.tsv.gz": Output of FindAllMarkers using the different stages (zygote, 2cell, 8cell, mESC) as clusters.
+
+## 0. Loading required libraries
+
+```{r}
+#suppressMessages(library("SingleCellExperiment"))
+#suppressMessages(library("scater"))
+suppressMessages(library("Seurat"))
+#library("scran")
+library("ggplot2")
+library("reshape2")
+library("stringr")
+library("patchwork")
+library("biomaRt")
+library("RColorBrewer")
+suppressMessages(library("dplyr"))
+set.seed(1)
+```
+
+# 1. Loading data
+
+## 1.1 Defining file names
+
+```{r}
+ANNOFN <- '../../combining_all_data/metadata/FR230814.samplesheet.tsv'
+COLORFN <- '../colors/manuscript_colors.tsv'
+
+COUNTFN <- '../../combining_all_data/data/celseq_counts/FR230814.CELseq.sample_counts.%s.celseq_pass.tsv.gz'
+PARKCLUSTERFN <- "../../DRA001066/data/tables/FR200923.Park_clusters_by_Ensembl_ID.tsv"
+
+HOMOZYGOUS_GENOTYPES = c("homozygous", "CAGGDamLMNB1_x_Rosa26CAGGCRE", "CAGGDamLMNB1_x_CAGGCRE")
+
+FIGOUTDIR <- '../output/figures/R1_Preimplantation_transcription.homozygous_untreated_main_analyses/'
+```
+
+## 1.2 Loading samplesheet
+
+```{r}
+anno <- read.table(ANNOFN, header=1, stringsAsFactors = FALSE, sep='\t')
+anno <- anno[(anno$CELseq_PASS == 'True') & (anno$cellcount == 1),]
+anno <- anno[anno$treatment == 'no_treatment',]
+anno <- anno[(anno$fusion_construct == 'Dam-Lmnb1'),]
+anno <- anno[(anno$genotype == 'homozygous') | (anno$stage=='mESC'),]
+
+color_df <- read.table(COLORFN, header=1, stringsAsFactors = FALSE, sep='\t', comment.char='')
+color_ls <- list()
+for (var in unique(color_df$variable)) {
+  ls <- as.list(color_df[color_df$variable==var,'hexcode'])
+  names(ls) <- as.list(color_df[color_df$variable==var,'value'])
+  color_ls[[var]] = ls
+}
+
+rownames(anno) <- anno$celseq_name
+dim(anno)
+```
+
+```{r}
+anno %>% group_by(stage, DamID_PASS) %>% count()
+```
+
+
+## 1.3 Loading Park (2015) gene clusters
+
+```{r}
+parkclusters <- read.csv(PARKCLUSTERFN, sep="\t", stringsAsFactors = T)
+```
+
+## 1.4 Loading count table
+The samples have been previously filtered with the following thresholds:  
+- # unique transcripts >= 3,000
+- % mitochondrial transcripts < 15%
+- % ERCC transcripts < 0.5%
+
+```{r}
+count.table.ls <- c()
+
+for (genotype in unique(anno$genotype)) {
+  if (genotype %in% HOMOZYGOUS_GENOTYPES) {
+    gt_name <-  str_replace_all(genotype, '/', '')
+  } else {
+    gt_name <- sprintf('%s.combined', str_replace_all(genotype, '/', ''))
+  }
+  print(gt_name)
+  
+  fn <- sprintf(COUNTFN, gt_name)
+  df <- read.table(fn, stringsAsFactors = F, header=1, sep='\t')
+  gene_info <- df[,c('gene_id', 'gene_name')]
+  count.table.ls <- c(count.table.ls, df[,3:ncol(df)])
+}
+
+count.table <- do.call("cbind", count.table.ls)
+rownames(count.table) <- gene_info$gene_id
+```
+
+```{r}
+## summing duplicate gene names
+#NOT WORKING: count.table <- count.table %>% select(!gene_id) #%>% group_by(gene_name) %>% summarise(across(everything(), sum))
+
+# find out how many duplicate gene names there are & adjust their names to be unique
+sum(duplicated(gene_info$gene_name))
+gene_info$gene_name_dedup <- gene_info$gene_name
+ind <- duplicated(gene_info$gene_name)
+gene_info[ind, 'gene_name_dedup'] <- paste(gene_info[ind, 'gene_name'], 1:sum(ind), sep='.d')
+sum(duplicated(gene_info$gene_name_dedup))
+
+# add park cluster information
+tmp <- parkclusters[,c('ensembl_gene_id', 'Cluster')]
+tmp <- tmp[!duplicated(tmp),]
+gene_info <- merge(gene_info, tmp, all.x=T, all.y=F, by.x='gene_id', by.y='ensembl_gene_id')
+cluster_levels <- c(levels(parkclusters$Cluster), 'No_Cluster')
+gene_info <- gene_info %>%
+  mutate(Cluster = factor(Cluster, levels=cluster_levels)) %>%
+  mutate(Cluster = replace(Cluster, is.na(Cluster), 'No_Cluster'))
+
+# replace duplicate gene cluster annotation by "No_Cluster"
+# this seems restrictive, but the observed double labels are not even similar...
+ind <- duplicated(gene_info$gene_id) | duplicated(gene_info$gene_id, fromLast=T)
+gene_info[ind,]
+gene_info[ind,'Cluster'] <- 'No_Cluster'
+gene_info <- gene_info[!duplicated(gene_info),]
+sum(duplicated(gene_info$gene_id))
+
+rownames(gene_info) <- gene_info$gene_id
+
+# format count.table
+# only contain samples also present in anno - same order
+# only contain genes also present in gene_info - same order - replace rownames with gene names
+count.table <- count.table[,rownames(anno)]
+count.table <- count.table[rownames(gene_info),]
+rownames(gene_info) <- gene_info$gene_name_dedup
+rownames(count.table) <- gene_info$gene_name_dedup
+```
+
+# 2. Processing data
+
+## 2.1 Filtering genes 
+
+### Plot: Number of samples in which a gene is expressed
+```{r}
+gene_info$nSamples <- rowSums(count.table > 0)
+
+ggplot(gene_info) +
+  geom_density(aes(x=nSamples, color=Cluster)) +
+  geom_vline(xintercept = 11) +
+  labs(x='# samples in which gene is observed') +
+  scale_x_log10()
+```
+
+### Determine which fraction of cells per stage express a gene
+```{r}
+for (stage in unique(anno$stage)) {
+  samples <- rownames(anno[(anno$stage==stage),])
+  gene_info[[stage]] <- rowMeans(count.table[rownames(gene_info), samples] > 0)
+}
+```
+
+```{r}
+to_plot <- melt(gene_info, id.vars = c('gene_id', 'gene_name', 'gene_name_dedup', 'Cluster', 'nSamples'), variable.name = 'stage', value.name = 'frac_expr')
+ggplot(to_plot) +
+  geom_density(aes(x=(frac_expr), color=stage)) +
+  facet_wrap(~Cluster, scales='free_y')
+```
+
+Removing ERCC & mitochondrial genes
+```{r}
+filt <- (!grepl('^ERCC', rownames(gene_info))) & (!grepl('^mt-', rownames(gene_info)))
+valid_gid <- rownames(gene_info[filt,])
+gene_info <- gene_info[valid_gid,]
+count.table <- count.table[valid_gid,]
+dim(count.table)
+```
+
+
+
+## 2.2 Seurat object for complete data - based on all genes observed in at least 10 samples
+This includes the embryo data and the mESC data.
+```{r}
+
+sample_select <- rownames(anno[anno$DamID_PASS=="True",])
+
+all.data <- CreateSeuratObject(
+  counts = count.table[,sample_select], meta.data=anno[sample_select,], 
+  project = 'preimplantation', min.cells = 10, min.features = 0
+)
+
+all.data <- NormalizeData(all.data, verbose = FALSE)
+all.data <- FindVariableFeatures(all.data, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+all.genes <- rownames(all.data)
+all.data <- ScaleData(all.data, features = all.genes, verbose = FALSE)
+
+
+```
+
+```{r}
+dim(all.data)
+```
+
+## 2.3 Seurat object for subset data - based on genes that are expressed in >=20% of cells of at least 1 stage
+```{r}
+ind <- rowSums(gene_info[,c('zygote', '2cell', '8cell', 'mESC')] > 0.25) > 1
+gid <- gene_info[ind,'gene_name_dedup']
+
+sample_select <- rownames(anno[anno$DamID_PASS=="True",])
+
+subset.data <- CreateSeuratObject(
+  counts = count.table[gid,sample_select], meta.data=anno[sample_select,], 
+  project = 'preimplantation', 
+  min.cells = 0, min.features = 0
+)
+subset.data <- NormalizeData(subset.data, verbose = FALSE)
+subset.data <- FindVariableFeatures(subset.data, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+subset.genes <- rownames(subset.data)
+subset.data <- ScaleData(subset.data, features = subset.genes, verbose = FALSE)
+
+```
+
+```{r}
+all.data <- RunPCA(all.data, features = VariableFeatures(all.data), seed.use = 1, verbose = F)
+subset.data <- RunPCA(subset.data, features = VariableFeatures(subset.data), seed.use = 1, verbose = F)
+ElbowPlot(object = all.data, ndims = 20) + labs(title = 'All genes')
+ElbowPlot(object = subset.data, ndims = 20) + labs(title = 'Subset genes')
+```
+
+```{r}
+all.data <- FindNeighbors(object = all.data, dims = 1:4, verbose = FALSE)
+all.data <- FindClusters(object = all.data, resolution = 0.5, verbose = FALSE)
+all.data <- RunUMAP(object = all.data, dims = 1:4, reduction.name = 'umap', seed.use = 1, verbose = FALSE, min.dist=0.4) #, metric='euclidean', n.neighbors = 10, min.dist=0.3, spread=0.5)
+
+subset.data <- FindNeighbors(object = subset.data, dims = 1:4, verbose = FALSE)
+subset.data <- FindClusters(object = subset.data, resolution = 0.5, verbose = FALSE)
+subset.data <- RunUMAP(object = subset.data, dims = 1:4, reduction.name = 'umap', seed.use = 1, verbose = FALSE)
+```
+
+```{r}
+DimPlot(all.data, group.by='stage')
+```
+
+
+```{r, fig.height=5, fig.width=6}
+PCAPlot(all.data, group.by='stage') + scale_color_manual(values=color_ls$stage)
+```
+
+
+```{r}
+DimPlot(all.data, group.by = 'stage') + 
+  ggtitle('Based on all genes') + 
+  scale_color_manual(values=color_ls$stage) + 
+  theme(aspect.ratio=1)
+outfn <- paste0(FIGOUTDIR, 'CELseq2_UMAP.homozygous_LMNB1_samples.colored_by_stage.pdf')
+# ggsave(outfn)
+
+tmp <- all.data@meta.data %>% group_by(stage) %>%count()
+outfn <- paste0(FIGOUTDIR, 'CELseq2_UMAP.homozygous_LMNB1_samples.cell_numbers.CELseq_and_DamID_PASS.tsv')
+# write.table(tmp, outfn, sep="\t", col.names = T, row.names = F)
+
+DimPlot(all.data, group.by = 'runid') + 
+  ggtitle('Based on all genes') + 
+  scale_color_brewer(palette = 'Paired') + 
+  theme(aspect.ratio=1)
+outfn <- paste0(FIGOUTDIR, 'CELseq2_UMAP.homozygous_LMNB1_samples.colored_by_runid.pdf')
+# ggsave(outfn)
+
+# DimPlot(all.data, group.by = 'fusion_construct') + 
+#   ggtitle('Based on all genes') + 
+#   scale_color_manual(values=color_ls$fusion_construct) + 
+#   theme(aspect.ratio=1)
+# outfn <- paste0(FIGOUTDIR, 'CELseq2_UMAP.homozygous_LMNB1_samples.colored_by_construct.pdf')
+# ggsave(outfn)
+
+DimPlot(subset.data, group.by = 'stage') + ggtitle('Subset genes') + scale_color_manual(values=color_ls$stage)
+DimPlot(subset.data, group.by = 'runid') + ggtitle('Subset genes') + scale_color_brewer(palette = 'Set1')
+```
+```{r}
+FeaturePlot(all.data, features = 'nTranscripts') +
+  scale_color_gradient(low='lightgrey', high='blue', trans="log", breaks = c(3000, 10000, 30000, 100000, 300000)) + 
+  theme(aspect.ratio=1)
+outfn <- paste0(FIGOUTDIR, 'CELseq2_UMAP.homozygous_LMNB1_samples.colored_by_nTranscripts_log.pdf')
+ggsave(outfn)
+
+FeaturePlot(all.data, features = 'nTranscripts') +
+  scale_color_gradient(low='lightgrey', high='blue') +
+  theme(aspect.ratio=1)
+outfn <- paste0(FIGOUTDIR, 'CELseq2_UMAP.homozygous_LMNB1_samples.colored_by_nTranscripts.pdf')
+# ggsave(outfn)
+```
+
+
+# 3. Ternary plots
+
+## 3.1 Select genes for ternary plots
+Select genes per category of interest: 
+- Maternal RNA: expressed in >=25% of zygote samples
+- Major ZGA: expressed in >= 25% of 2-cell samples
+- MGA: expressed in >= 25% of mESC samples
+```{r}
+gid_maternal <- gene_info[(gene_info$Cluster == 'Maternal_RNA') & (gene_info$zygote >= 0.25),'gene_name_dedup']
+gid_zga <- gene_info[(gene_info$Cluster == 'Major_ZGA') & (gene_info[,'2cell'] >= 0.25),'gene_name_dedup']
+gid_mga <- gene_info[(gene_info$Cluster == 'MGA') & (gene_info$mESC >= 0.25),'gene_name_dedup']
+
+to_plot_ternary <- anno[, c('stage', 'runid', 'nTranscripts')]
+samples <- rownames(to_plot_ternary)
+to_plot_ternary$Maternal_RNA <- colSums(count.table[gid_maternal,samples])
+to_plot_ternary$Major_ZGA <- colSums(count.table[gid_zga,samples])
+to_plot_ternary$MGA <- colSums(count.table[gid_mga,samples])
+to_plot_ternary$n_total <- rowSums(to_plot_ternary[,c('Maternal_RNA', 'Major_ZGA', 'MGA')])
+to_plot_ternary[,c('Maternal_RNA', 'Major_ZGA', 'MGA')] <- to_plot_ternary[,c('Maternal_RNA', 'Major_ZGA', 'MGA')] / to_plot_ternary$n_total
+```
+
+## 3.2 Plotting function
+```{r}
+library(Ternary)
+```
+```{r}
+make_ternary_plot <- function(tmp, plot_cols, color_by='stage') {
+  TernaryPlot(alab = '% Maternal RNA', blab =  '% Major ZGA', clab = '% MGA')
+  
+  if (color_by %in% names(color_ls)){
+    clrpal <- color_ls[[color_by]]
+  } else {
+    clrpal <- c(brewer.pal(name='Set2',n=8), brewer.pal(name='Paired',n=12))
+    vars <- unique(tmp[[color_by]])
+    clrpal <- clrpal[1:length(vars)]
+    names(clrpal) <- vars
+  }
+  
+  clrs <- sapply(tmp[[color_by]], FUN = function(s) clrpal[[s]])
+  #print(clrpal)
+  #print(clrs)
+
+  TernaryPoints(tmp[,plot_cols], col = clrs, pch = 1, lwd = 2)
+  legend('topleft', names(clrpal), col = clrpal, pch = 1, lwd = 2, lty=NA)
+}
+```
+
+
+```{r}
+outfn <- paste0(FIGOUTDIR, 'ternary_plot.homozygous_LMNB1_samples.colored_by_runid.pdf')
+pdf(outfn)
+make_ternary_plot(to_plot_ternary, plot_cols=c('Maternal_RNA', 'Major_ZGA', 'MGA'), color_by='runid')
+dev.off()
+
+outfn <- paste0(FIGOUTDIR, 'ternary_plot.homozygous_LMNB1_samples.colored_by_stage.pdf')
+pdf(outfn)
+make_ternary_plot(to_plot_ternary, plot_cols=c('Maternal_RNA', 'Major_ZGA', 'MGA'), color_by='stage')
+dev.off()
+```
+
+
+
+### 4.2 Fraction of reads per sample that belonging to the different Park clusters
+
+#### Prepping data
+```{r}
+samples <- rownames(anno[(anno$genotype=='homozygous') | (anno$stage=='mESC'),])
+goi <- gene_info[rownames(count.table),] %>% arrange(Cluster)
+to_plot <- as.data.frame(count.table[goi$gene_name_dedup,samples])
+to_plot$cluster <- goi$Cluster
+to_plot <- to_plot %>% group_by(cluster) %>% summarise(across(everything(), sum))
+clusters <- to_plot$cluster
+to_plot <- to_plot %>% select(!cluster)
+to_plot <- t(to_plot)
+colnames(to_plot) <- clusters
+
+totals <- colSums(count.table[,samples])
+to_plot <- to_plot / totals
+
+to_plot <- to_plot %>% 
+  cbind(anno[rownames(to_plot),c('stage', 'runid', 'treatment', 'genotype')]) %>%
+  melt(id.vars=c('stage','runid','treatment', 'genotype'), value.name = 'fraction', variable.name='cluster')
+
+cluster_order <- c(
+  "Maternal_RNA", "Maternal_to_ZGA", "Maternal_to_MGA",
+  "1-Cell_Transient", "Minor_ZGA", "Minor_ZGA_to_MGA", "2-Cell_Transient", "Major_ZGA", 
+  "4-Cell_Transient", "MGA", "No_Cluster"               
+)
+
+n_per_cluster = list()
+for (cluster in cluster_order) {
+  n = sum(goi$Cluster == cluster)
+  n_per_cluster[[cluster]] <- sprintf('%s (N = %d)', cluster, n)
+}
+
+tmp_func <- function(c) n_per_cluster[c][[1]]
+to_plot$cluster_n <- sapply(as.character(to_plot$cluster), tmp_func)
+to_plot$cluster_n <- factor(to_plot$cluster_n, levels=n_per_cluster)
+to_plot$stage <- factor(to_plot$stage, levels=c('zygote', '2cell', '8cell', 'mESC'))
+```
+
+#### Fraction of a cell's total transcripts belonging to each of the Park clusters - samples separated by stage
+```{r}
+to_plot %>%
+  filter(treatment == 'no_treatment') %>%
+  ggplot() +
+  geom_violin(aes(x=stage, y=fraction, fill=stage), draw_quantiles = 0.5) +
+  facet_wrap(~cluster_n, scales='free') + 
+  labs(y='fraction of total transcripts per cell', x='stage') +
+  theme_bw() +
+  scale_fill_manual(values = color_ls$stage)
+
+outfn <- paste0(FIGOUTDIR, 'fraction_of_cells_transcripts_belonging_to_Park_clusters.pdf')
+# ggsave(outfn, width=12, height=7)
+```
+
+
+### 4.1 Heatmap showing the expression over stages in the different clusters
+```{r}
+library(pheatmap)
+```
+
+
+```{r}
+# selecting genes, ordered by Park clusters
+goi <- gene_info 
+cluster_order <- c(
+  "Maternal_RNA",
+  "1-Cell_Transient", "Minor_ZGA", "2-Cell_Transient", "Major_ZGA", "Maternal_to_ZGA", 
+  "4-Cell_Transient", "MGA", "Maternal_to_MGA", "Minor_ZGA_to_MGA"                     
+)
+goi <- goi[goi$Cluster %in% cluster_order,]
+goi$Cluster <- factor(goi$Cluster, levels=cluster_order)
+goi <- goi %>% 
+  filter(gene_name %in% rownames(all.data)) %>%
+  arrange(Cluster)
+goi <- goi$gene_name
+```
+```{r}
+# selecting relevant data
+sample_order <- anno %>%
+  filter((stage != 'mESC') & (treatment == 'no_treatment') & (celseq_name %in% colnames(all.data))) %>%
+  mutate(stage = factor(stage, levels=c('zygote', '2cell', '8cell'))) %>%
+  arrange(stage, runid) %>%
+  pull(celseq_name)
+to_plot <- GetAssayData(all.data, slot='scale.data')
+to_plot <- to_plot[goi,sample_order]
+```
+
+```{r echo=FALSE, fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+# preparing info for legend
+row_annotation <- gene_info %>% 
+  filter((gene_name %in% goi)) %>% 
+  mutate(Cluster = factor(Cluster, levels=cluster_order)) %>%
+  arrange(Cluster) %>%
+  select(Cluster)
+tmp <- brewer.pal(n = length(cluster_order), name = "Set3")
+names(tmp) <- cluster_order
+ann_colors <- list("Cluster" = tmp)
+colors <- colorRampPalette( c('darkblue', 'blue', 'grey', 'red', 'darkred') )(255)
+
+outfn = paste0(FIGOUTDIR, 'heatmap.gene_expression_of_Park_genes_across_stages.png')
+#pdf(outfn)
+plot_heatmap1 <- pheatmap(to_plot,
+         col=colors,
+         breaks=seq(-4,4,length.out = 256),
+         cluster_cols=F,
+         cluster_rows=F,
+         show_rownames=F,
+         show_colnames=F,
+         cellheigth=5,
+         annotation_row = row_annotation,
+         annotation_colors = ann_colors,
+         annotation_col = anno[sample_order, c('stage', 'runid')],
+         filename=outfn
+)
+#dev.off()
+```
+
+```{r}
+# saveRDS(all.data, file='../data/FR230814.all_LMNB1_homozygous_samples.Seurat_object.rds')
+```
+
+

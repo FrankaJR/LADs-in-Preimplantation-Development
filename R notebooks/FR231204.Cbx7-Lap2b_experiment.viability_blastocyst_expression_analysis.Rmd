@@ -1,0 +1,294 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# 0. Loading required libraries
+
+```{r}
+suppressMessages(library("Seurat"))
+library("ggplot2")
+library("reshape2")
+library("stringr")
+library("patchwork")
+library("biomaRt")
+library("RColorBrewer")
+library("Matrix")
+suppressMessages(library("dplyr"))
+set.seed(1)
+```
+
+# 1. Loading data
+
+## 1.1 Defining file names
+
+```{r}
+ANNOFN <- '../../KIN9136/metadata/KIN9136.samplesheet.tsv'
+COUNTFN <- '../../KIN9136//data/celseq_tables/KIN9136.index39.counts.tsv.gz'
+PARKCLUSTERFN <- "../../DRA001066/data/tables/FR200923.Park_clusters_by_Ensembl_ID.tsv"
+
+FIGOUTDIR <- '../output/figures/R3_Cbx7-Lap2b_experiment.viability_blastocyst_expression_analysis/'
+```
+
+## 1.2 Loading samplesheet
+
+```{r}
+anno <- read.table(ANNOFN, header=1, stringsAsFactors = FALSE, sep='\t')
+anno <- anno %>% filter((illumina_index==39) & (cellcount == 'whole_embryo'))
+anno$celseq_name <- apply(anno, MARGIN=1, FUN = function(r) {sprintf('KIN9136.index39.CELseq2_BC_%03d', as.integer(r['celseq2_adapter_number']))})
+rownames(anno) <- anno$celseq_name
+```
+
+## 1.3 Loading transcript counts
+```{r}
+count.table <- read.table(COUNTFN, stringsAsFactors = F, header=1, sep='\t')
+gene_info <- count.table[,c('gene_id', 'gene_name')]
+count.table <- count.table[,anno$celseq_name]
+
+# remove duplicate gene names
+ind <- duplicated(gene_info$gene_name)
+gene_info[ind, 'gene_name'] <- paste(gene_info[ind, 'gene_name'], 1:sum(ind), sep=':d')
+
+rownames(count.table) <- gene_info$gene_name
+```
+
+# 2. Sample statistics
+
+## 2.1 Compute sample statistics
+```{r}
+anno$nTranscripts <- colSums(count.table)
+anno$nGenes <- colSums( (count.table > 0) )
+
+ind <- grep('^mt-', rownames(count.table))
+anno$nMito <- colSums(count.table[ind,])
+anno$pctMito <- anno$nMito / anno$nTranscripts * 100
+
+ind <- grep('^ERCC', rownames(count.table))
+anno$nERCC <- colSums(count.table[ind,])
+anno$pctERCC <- anno$nERCC / anno$nTranscripts * 100
+```
+
+## 2.2 Total number of transcripts
+```{r}
+ggplot(anno) + 
+  geom_violin(aes(x=stage, y=log10(nTranscripts + 1)), draw_quantiles = 0.5) +
+  geom_jitter(aes(x=stage, y=log10(nTranscripts + 1))) +
+  geom_hline(yintercept = log10(20000))
+```
+## 2.3 Number of observed genes
+```{r}
+ggplot(anno) + 
+  geom_violin(aes(x=stage, y=log10(nGenes + 1)), draw_quantiles = 0.5) +
+  geom_jitter(aes(x=stage, y=log10(nGenes + 1))) +
+  geom_hline(yintercept = log10(4000))
+```
+
+## 2.4 Percentage mitochondrial reads
+```{r}
+ggplot(anno[anno$nTranscripts>20000,]) + 
+  geom_violin(aes(x=stage, y=pctMito), draw_quantiles = 0.5) +
+  geom_jitter(aes(x=stage, y=pctMito))
+```
+
+## 2.5 Percentage ERCC reads
+```{r}
+ggplot(anno[anno$nTranscripts>20000,]) + 
+  geom_violin(aes(x=stage, y=pctERCC), draw_quantiles = 0.5) +
+  geom_jitter(aes(x=stage, y=pctERCC))
+```
+
+## 2.6 Number of samples in which a gene is observed
+
+```{r}
+gene_info$nSamples <- rowSums((count.table > 0))
+gene_info$total_transcripts <- rowSums(count.table)
+
+ggplot(gene_info) + 
+  geom_histogram(aes(x=nSamples)) +
+  scale_x_log10()
+```
+
+
+
+
+
+# 3. Process data
+
+## 3.1 Generate Seurat object
+```{r}
+expr.data <- CreateSeuratObject(
+  counts = count.table, 
+  project = 'preimplantation', 
+  min.cells = 5, min.features = 4000, 
+  meta.data=anno
+  )
+
+expr.data <- NormalizeData(expr.data, verbose = FALSE)
+expr.data <- FindVariableFeatures(expr.data, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+all.genes <- rownames(expr.data)
+expr.data <- ScaleData(expr.data, features = all.genes, verbose = FALSE)
+expr.data <- RunPCA(expr.data, features = VariableFeatures(expr.data), seed.use = 1, verbose = F)
+```
+
+
+
+## 3.2 Generate UMAP
+```{r}
+ElbowPlot(object = expr.data, ndims = 50)
+```
+
+```{r}
+expr.data <- FindNeighbors(object = expr.data, dims = 1:20, verbose = FALSE)
+expr.data <- FindClusters(object = expr.data, resolution = 0.5, verbose = FALSE)
+expr.data <- RunUMAP(object = expr.data, dims = 1:20, reduction.name = 'umap', seed.use = 1, verbose = FALSE)
+```
+
+## 3.3 Plot UMAP
+```{r}
+library(RColorBrewer)
+```
+
+```{r}
+expr.data@meta.data['label'] = apply(expr.data@meta.data,1,FUN = function (r){sprintf('%s - %s', r['stage'], r['treatment'])})
+clrs <- brewer.pal(n = 7, name = "Set1")
+DimPlot(expr.data, group.by = 'label', pt.size = 3, shape.by = 'treatment') +  scale_color_brewer(palette = 'Paired') + ggtitle('UMAP viability embryos')
+
+outfn <- paste0(FIGOUTDIR, 'UMAP_viability_analysis.pdf')
+ggsave(outfn)
+```
+
+## 3.4 Call DE genes
+
+### Option 1: Cbx7-Lap2b vs Lap2b, all stages combined
+```{r}
+expr.data <- SetIdent(expr.data, value='treatment')
+treatment.markers <- FindAllMarkers(expr.data)
+```
+
+```{r}
+treatment.markers %>% filter(p_val_adj < 0.05)
+outfn <- paste0(FIGOUTDIR, 'DE_genes.Cbx7-Lap2b_vs_Lap2b.all_stages.n=0.tsv')
+write.table(treatment.markers, outfn, quote=F, sep='\t', row.names=F, col.names=T)
+```
+
+### Option 2: Cbx7-Lap2b vs Lap2b per stage
+```{r}
+results <- list()
+for (stage in unique(anno$stage)) {
+  tmp <- expr.data[,expr.data$stage==stage]
+  tmp <- SetIdent(tmp, value='treatment')
+  markers <- FindAllMarkers(tmp)
+  markers$stage = stage
+  results[[stage]] <- markers
+}
+stagetreatment.markers <- do.call('rbind', results)
+```
+
+```{r}
+stagetreatment.markers %>% filter(p_val_adj < 0.05)
+outfn <- paste0(FIGOUTDIR, 'DE_genes.Cbx7-Lap2b_vs_Lap2b.per_stage.n=0.tsv')
+write.table(stagetreatment.markers, outfn, quote=F, sep='\t', row.names=F, col.names=T)
+```
+
+## 3.5 Scatter plot of expression
+```{r}
+to_plot_ls <- list()
+
+for (stage in unique(anno$stage)) {
+  t1 = 'Lap2b'
+  t2 = 'Cbx7(CD)-Lap2b'
+  tmp <- expr.data@meta.data
+  
+  samples1 <- rownames(tmp[(tmp$stage == stage) & (tmp$treatment == t1),])
+  samples2 <- rownames(tmp[(tmp$stage == stage) & (tmp$treatment == t2),])
+  
+  
+  A = GetAssayData(expr.data, slot='data')
+  df <- data.frame( 'Lap2b' = rowMeans(A[,samples1]), 'Cbx7Lap2b' = rowMeans(A[,samples2]))
+  df$stage <- stage
+  
+  to_plot_ls[[stage]] = df
+  
+}
+
+to_plot <- do.call(rbind, to_plot_ls)
+
+```
+
+```{r}
+ggplot(to_plot) + 
+  geom_point(data=to_plot, aes(x=Lap2b, y=Cbx7Lap2b)) + 
+  facet_grid(~stage) +
+  theme_bw() +
+  theme(aspect.ratio=1) +
+  geom_abline(slope=1, yintercept=0, color='red') +
+  annotate(geom='text',x=0, y=4, label='no sign. DE genes', hjust=0)
+outfn <- paste0(FIGOUTDIR, 'DE_expr_scatter.pdf')
+ggsave(outfn)
+```
+```{r}
+for (s in unique(to_plot$stage)) {
+  a <- to_plot %>% filter(stage == s) %>% pull(Lap2b)
+  b <- to_plot %>% filter(stage == s) %>% pull(Cbx7Lap2b)
+  print(s)
+  print(cor.test(a,b,method='pearson'))
+}
+```
+
+
+## 3.6 Sex balance
+```{r}
+A = GetAssayData(expr.data, slot='data')
+to_plot = data.frame(
+  Xist = A['Xist',], Tsix=A['Tsix',], 
+  treatment = expr.data$treatment, stage = expr.data$stage
+  )
+
+ggplot(to_plot) + 
+  geom_point(aes(x=Xist, y=Tsix, color=treatment)) +
+  theme_classic() +
+  theme(aspect.ratio = 1) + 
+  geom_vline(xintercept = 1.5, color='black', linetype=2)
+
+outfn <- paste0(FIGOUTDIR, 'determining_sex_based_on_Xist.pdf')
+ggsave(outfn)
+```
+```{r}
+to_plot$sex = 'female'
+to_plot[to_plot$Xist < 1.5,'sex'] = 'male'
+tmp <- to_plot %>% 
+  group_by(stage, treatment, sex) %>%
+  count() %>%
+  data.frame()
+tmp <- reshape(tmp, idvar = c('stage', 'treatment'), timevar = 'sex', direct='wide')
+tmp$total <- tmp$n.female + tmp$n.male
+tmp$f.female <- tmp$n.female / tmp$total
+tmp$f.male <- tmp$n.male / tmp$total
+tmp
+```
+```{r}
+to_plot <- tmp %>% select(stage, treatment, f.female, f.male)
+colnames(to_plot) <- c('stage','treatment','female','male')
+to_plot <- melt(to_plot, id.vars = c('stage','treatment'), variable.name='sex', value.name='fraction')
+
+to_plot2 <- tmp %>% select(stage, treatment, n.female, n.male)
+colnames(to_plot2) <- c('stage','treatment','female','male')
+to_plot2 <- to_plot2 %>% rowwise() %>% mutate(pval = chisq.test(c(female,male))$p.value)
+to_plot2 <- melt(to_plot2, id.vars = c('stage','treatment', 'pval'), variable.name='sex', value.name='n')
+
+to_plot <- merge(to_plot, to_plot2, by = c('stage', 'treatment', 'sex'))
+to_plot <- to_plot %>% mutate(pval_text = sprintf('Chi-squared\np=%.3f', pval))
+
+ggplot(to_plot) + 
+  geom_col(aes(x=treatment, y=fraction, fill=sex)) +
+  geom_text(aes(x=treatment, y=fraction, fill=sex, label=n), position = position_fill(vjust = 0.5)) +
+  geom_text(aes(x=treatment, label=pval_text), y=1, vjust=0) + 
+  facet_grid(~stage) + 
+  theme_classic() +
+  labs(y='fraction of embryos')
+  
+outfn <- paste0(FIGOUTDIR, 'sex_distribution.pdf')
+ggsave(outfn)
+```
+
+
